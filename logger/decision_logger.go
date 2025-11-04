@@ -78,9 +78,42 @@ func NewDecisionLogger(logDir string) *DecisionLogger {
 		fmt.Printf("⚠ 创建日志目录失败: %v\n", err)
 	}
 
+	// 从历史记录中恢复最大的 cycle 编号
+	maxCycle := 0
+	files, err := ioutil.ReadDir(logDir)
+	if err == nil {
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			if filepath.Ext(file.Name()) != ".json" {
+				continue
+			}
+
+			fullPath := filepath.Join(logDir, file.Name())
+			data, err := ioutil.ReadFile(fullPath)
+			if err != nil {
+				continue
+			}
+
+			var record DecisionRecord
+			if err := json.Unmarshal(data, &record); err != nil {
+				continue
+			}
+
+			if record.CycleNumber > maxCycle {
+				maxCycle = record.CycleNumber
+			}
+		}
+	}
+
+	if maxCycle > 0 {
+		fmt.Printf("📊 恢复历史记录：最大 cycle 编号 = %d，将从 %d 继续\n", maxCycle, maxCycle+1)
+	}
+
 	return &DecisionLogger{
 		logDir:      logDir,
-		cycleNumber: 0,
+		cycleNumber: maxCycle,
 	}
 }
 
