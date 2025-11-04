@@ -113,7 +113,7 @@ func GetFullDecisionWithCustomPrompt(ctx *Context, mcpClient *mcp.Client, custom
 	}
 
 	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
 	if err != nil {
 		return decision, fmt.Errorf("解析AI响应失败: %w", err)
 	}
@@ -387,7 +387,7 @@ func buildUserPrompt(ctx *Context) string {
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity, availableBalance float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
 
@@ -401,7 +401,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 	}
 
 	// 3. 验证决策
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+	if err := validateDecisions(decisions, accountEquity, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -469,9 +469,26 @@ func fixMissingQuotes(jsonStr string) string {
 }
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecisions(decisions []Decision, accountEquity, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
+	// 计算所有开仓决策需要的总保证金
+	totalRequiredMargin := 0.0
+	for _, decision := range decisions {
+		if decision.Action == "open_long" || decision.Action == "open_short" {
+			requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
+			totalRequiredMargin += requiredMargin
+		}
+	}
+
+	// 如果总需要的保证金超过可用余额，验证失败
+	// 添加5%缓冲以避免浮点数精度问题和市场波动
+	if totalRequiredMargin > availableBalance*0.95 {
+		return fmt.Errorf("可用余额不足: 需要%.2f USDT保证金，但可用余额仅%.2f USDT (需预留5%%缓冲)", 
+			totalRequiredMargin, availableBalance)
+	}
+
+	// 验证每个决策
 	for i, decision := range decisions {
-		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+		if err := validateDecision(&decision, accountEquity, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
 			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
 		}
 	}
@@ -501,7 +518,7 @@ func findMatchingBracket(s string, start int) int {
 }
 
 // validateDecision 验证单个决策的有效性
-func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecision(d *Decision, accountEquity, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
 	// 验证action
 	validActions := map[string]bool{
 		"open_long":   true,
@@ -541,6 +558,15 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 				return fmt.Errorf("山寨币单币种仓位价值不能超过%.0f USDT（1.5倍账户净值），实际: %.0f", maxPositionValue, d.PositionSizeUSD)
 			}
 		}
+
+		// ⚠️ 关键：检查可用余额是否足够支付保证金
+		requiredMargin := d.PositionSizeUSD / float64(d.Leverage)
+		// 添加5%缓冲以避免浮点数精度问题和市场波动
+		if requiredMargin > availableBalance*0.95 {
+			return fmt.Errorf("可用余额不足: %s开仓需要%.2f USDT保证金(仓位%.0f USDT/%dx杠杆)，但可用余额仅%.2f USDT (需预留5%%缓冲)", 
+				d.Symbol, requiredMargin, d.PositionSizeUSD, d.Leverage, availableBalance)
+		}
+
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
 			return fmt.Errorf("止损和止盈必须大于0")
 		}
